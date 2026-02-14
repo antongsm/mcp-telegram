@@ -32,3 +32,11 @@ README.ru.md
 # Session and config (user-specific)
 *.session
 config.json
+
+# Local scripts with credentials
+telebot_audio.py
+
+# Test files
+test_voice.txt
+tg_audio.txt
+tg_audio_mix.txt

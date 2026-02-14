@@ -16,6 +16,7 @@ import asyncio
 import importlib.metadata
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -69,6 +70,15 @@ def async_command(func: Callable[..., Coroutine[Any, Any, Any]]) -> Callable[...
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         return asyncio.run(func(*args, **kwargs))
     return wrapper
+
+
+def clean_input(value: str) -> str:
+    """Strip ANSI escape sequences and non-printable characters from input.
+
+    Rich console.input() can capture escape sequences when text is pasted,
+    e.g. '\\x1b32913403' instead of '32913403'. This corrupts config values.
+    """
+    return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value).strip()
 
 
 # =============================================================================
@@ -142,24 +152,29 @@ def login() -> None:
 
     # API ID
     default_id = config.user.api_id or ""
-    api_id = console.input(
+    api_id = clean_input(console.input(
         f"[cyan]API ID[/cyan]{f' [{default_id}]' if default_id else ''}: "
-    ).strip() or default_id
+    )) or default_id
+
+    if api_id and not api_id.isdigit():
+        console.print("[red]✗ API ID must be numeric[/red]")
+        raise typer.Exit(1)
+
     config.user.api_id = api_id
 
     # API Hash
     default_hash = config.user.api_hash or ""
     masked = f"{default_hash[:8]}..." if default_hash else ""
-    api_hash = console.input(
+    api_hash = clean_input(console.input(
         f"[cyan]API Hash[/cyan]{f' [{masked}]' if masked else ''}: "
-    ).strip() or default_hash
+    )) or default_hash
     config.user.api_hash = api_hash
 
     # Phone
     default_phone = config.user.phone or ""
-    phone = console.input(
+    phone = clean_input(console.input(
         f"[cyan]Phone[/cyan]{f' [{default_phone}]' if default_phone else ''}: "
-    ).strip() or default_phone
+    )) or default_phone
     config.user.phone = phone
 
     # Save config
@@ -185,22 +200,13 @@ def login() -> None:
         # Token
         default_token = config.bot.token or ""
         masked_token = f"{default_token[:10]}..." if default_token else ""
-        token = console.input(
+        token = clean_input(console.input(
             f"[cyan]Bot Token[/cyan]{f' [{masked_token}]' if masked_token else ''}: "
-        ).strip() or default_token
+        )) or default_token
         config.bot.token = token
 
-        # Chat ID
-        default_chat = config.bot.chat_id or ""
-        chat_id = console.input(
-            f"[cyan]Chat ID[/cyan]{f' [{default_chat}]' if default_chat else ''}: "
-        ).strip() or default_chat
-        config.bot.chat_id = chat_id
-
-        config.save()
-        console.print("[green]✓ Bot config saved[/green]")
-
-        # Test bot
+        # Test bot and detect chat_id
+        bot_username = ""
         if token:
             console.print("[yellow]Testing bot...[/yellow]")
             try:
@@ -211,11 +217,82 @@ def login() -> None:
                 data = response.json()
                 if data.get("ok"):
                     bot_info = data.get("result", {})
-                    console.print(f"[green]✓ Bot: @{bot_info.get('username')}[/green]")
+                    bot_username = bot_info.get("username", "")
+                    console.print(f"[green]✓ Bot: @{bot_username}[/green]")
                 else:
                     console.print(f"[red]✗ Bot error: {data.get('description')}[/red]")
             except Exception as e:
                 console.print(f"[red]✗ Failed to test bot: {e}[/red]")
+
+        # Chat ID — auto-detect or manual
+        default_chat = config.bot.chat_id or ""
+        console.print(
+            f"\n[cyan]Chat ID[/cyan] — your numeric user ID for bot notifications."
+        )
+
+        if bot_username:
+            console.print(
+                f"[dim]To auto-detect: send any message to @{bot_username}, then press Enter.[/dim]"
+            )
+
+        chat_id = clean_input(console.input(
+            f"[cyan]Chat ID[/cyan]{f' [{default_chat}]' if default_chat else ''} "
+            f"(Enter to auto-detect): "
+        )) or default_chat
+
+        # Auto-detect chat_id if empty or user pressed Enter
+        if not chat_id and token:
+            console.print("[yellow]Detecting chat ID from recent messages...[/yellow]")
+            try:
+                response = httpx.get(
+                    f"https://api.telegram.org/bot{token}/getUpdates",
+                    params={"limit": 5},
+                    timeout=10.0,
+                )
+                data = response.json()
+                if data.get("ok"):
+                    updates = data.get("result", [])
+                    for update in reversed(updates):
+                        msg = update.get("message", {})
+                        chat = msg.get("chat", {})
+                        detected_id = chat.get("id")
+                        if detected_id:
+                            chat_id = str(detected_id)
+                            from_user = msg.get("from", {})
+                            console.print(
+                                f"[green]✓ Detected chat ID: {chat_id} "
+                                f"({from_user.get('first_name', '')})[/green]"
+                            )
+                            break
+
+                if not chat_id:
+                    console.print(
+                        f"[yellow]No messages found. Send a message to @{bot_username} "
+                        f"and re-run setup, or enter chat ID manually.[/yellow]"
+                    )
+                    chat_id = clean_input(console.input(
+                        "[cyan]Chat ID[/cyan] (numeric): "
+                    ))
+            except Exception as e:
+                console.print(f"[red]✗ Auto-detect failed: {e}[/red]")
+                chat_id = clean_input(console.input(
+                    "[cyan]Chat ID[/cyan] (numeric): "
+                ))
+
+        # Validate chat_id is numeric (not a username)
+        if chat_id and not chat_id.lstrip("-").isdigit():
+            console.print(
+                f"[red]✗ Chat ID must be numeric, got '{chat_id}'. "
+                f"This looks like a username, not a chat ID.[/red]"
+            )
+            console.print(
+                f"[dim]Send a message to your bot and re-run 'tg login' to auto-detect.[/dim]"
+            )
+            chat_id = ""
+
+        config.bot.chat_id = chat_id
+        config.save()
+        console.print("[green]✓ Bot config saved[/green]")
 
     # =========================
     # Summary
